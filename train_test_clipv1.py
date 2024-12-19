@@ -29,7 +29,7 @@ def set_random_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-class ImageDataset(Dataset):
+class FakeRealDataset(Dataset):
     def __init__(self, hdf5_filename, labels_filename=None, dataset_name='train_features'):
         self.hdf5_filename = hdf5_filename
         self.dataset_name = dataset_name
@@ -58,9 +58,9 @@ class ImageDataset(Dataset):
         else:
             return feature
 
-class ClassifierModel(nn.Module):
+class DetectorModel(nn.Module):
     def __init__(self):
-        super(ClassifierModel, self).__init__()
+        super(DetectorModel, self).__init__()
 
         dropout_rate = 0.335
 
@@ -97,27 +97,28 @@ class ClassifierModel(nn.Module):
         return output,features
 
 
-
 parser = argparse.ArgumentParser(description='')
 
-parser.add_argument('--seed', default=-1, type=int,
+parser.add_argument('--seed', default=8079, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--num_epochs', default=100, type=int)
 parser.add_argument('--lr', '--learning-rate', default=1e-5, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
+# parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
+#                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for the scheduler')
 parser.add_argument('--weight_decay', default=6e-5, type=float,
                     metavar='W', help='weight decay (default: 6e-5)',
                     dest='weight_decay')
 
-parser.add_argument('--checkpoints_dir', default='checkpoints_H14', type=str)
-parser.add_argument('--train_datapath', default='cup_train.csv', type=str)
+parser.add_argument('--checkpoints_dir', default='checkpoints_realAs1', type=str)
+parser.add_argument('--train_datapath', default='cup_train_realAS1.csv', type=str)
 parser.add_argument('--train_batchsize', default=256, type=int)
 parser.add_argument('--workers', default=8, type=int)
 
 #################################test##############################
 parser.add_argument("--test_datapath", type=str,
-                        default='cup_val.csv', help="test data path")
+                        default='cup_val_realAS1.csv', help="test data path")
 parser.add_argument('--test_batchsize', default=32, type=int)
 
 
@@ -127,7 +128,7 @@ args = parser.parse_args()
 # metrics_file_path = f"{args.checkpoints}/traing_log.txt"
 os.makedirs(args.checkpoints_dir, exist_ok=True)
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:6' if torch.cuda.is_available() else 'cpu')
 
 def threshplus_tensor(x):
     y = x.clone()
@@ -140,6 +141,63 @@ def search_func(losses, alpha):
 
 def searched_lamda_loss(losses, searched_lamda, alpha):
     return searched_lamda + ((1.0/alpha)*torch.mean(threshplus_tensor(losses-searched_lamda))) 
+
+def augment_features(features):
+    # Helper Functions
+    def hard_example_interpolation(z_i, hard_example, lambda_1):
+        return z_i + lambda_1 * (hard_example - z_i)
+
+    def hard_example_extrapolation(z_i, mean_latent, lambda_2):
+        return z_i + lambda_2 * (z_i - mean_latent)
+
+    def add_gaussian_noise(z_i, sigma, lambda_3):
+        epsilon = torch.randn_like(z_i) * sigma
+        return z_i + lambda_3 * epsilon
+
+    def affine_transformation(z_i, angle, scale):
+        # Create an affine transformation matrix
+        theta = torch.tensor([
+            [scale * torch.cos(angle), -scale * torch.sin(angle), 0],
+            [scale * torch.sin(angle), scale * torch.cos(angle), 0]
+        ]).to(z_i.device)
+
+        # Apply the transformation (assume z_i is flattened into a 2D vector)
+        z_i_flat = z_i.view(-1, 2)  # Reshape to 2D coordinates
+        z_i_transformed = torch.mm(z_i_flat, theta.T)
+        return z_i_transformed.view(z_i.shape)  # Reshape back to original
+
+    def distance(z_i, z_j):
+        return torch.norm(z_i - z_j)
+
+    # all_fake_samples = torch.cat(feature_maps, dim=0)
+    mean_latent = torch.mean(features, dim=0)
+
+    # Identify the hardest example (farthest from the mean)
+    distances = torch.tensor([distance(z, mean_latent) for z in features])
+    hard_example = features[torch.argmax(distances)]
+
+    # Augment the feature maps
+    augmented_features = []
+    for feature in features:
+        # Choose a random augmentation
+        augmentations = [
+            # lambda z: hard_example_interpolation(z, hard_example, random.random()),
+            # lambda z: hard_example_extrapolation(z, mean_latent, random.random()),
+            lambda z: add_gaussian_noise(z, random.random(), random.random()),
+            # lambda z: affine_transformation(z, random.uniform(-3.14, 3.14), random.uniform(0.8, 1.2))
+        ]
+        chosen_aug = random.choice(augmentations)
+        # augmented = torch.stack([chosen_aug(z) for z in feature])
+        # augmented_features.append(augmented)
+        augmented_feature = chosen_aug(feature)  # Apply directly if `feature` is not iterable
+        augmented_features.append(augmented_feature)
+        # for z in feature:
+        #     print(f"Input shape: {z.shape}")
+        #     augmented_z = chosen_aug(z)
+        #     print(f"Augmented shape: {augmented_z.shape}")
+        #     augmented_features.append(augmented_z)
+
+    return torch.stack(augmented_features)
 
 
 class pAUCLoss(nn.Module):
@@ -172,7 +230,7 @@ class pAUCLoss(nn.Module):
             
 class BinaryVSLoss(nn.Module):
 
-    def __init__(self, iota_pos=-0.05, iota_neg=0.05, Delta_pos=0.8, Delta_neg=1.2, weight=None):
+    def __init__(self, reduction, iota_pos=-0.05, iota_neg=0.05, Delta_pos=0.8, Delta_neg=1.2, weight=None ):
         super(BinaryVSLoss, self).__init__()
         # Initialize iota and Delta tensors on the default device
         # iota [-1,1], delta [0.5,2]
@@ -182,6 +240,7 @@ class BinaryVSLoss(nn.Module):
         # multiplicative adjustments for negative and positive labels, respectively
         self.Delta_list = torch.tensor([Delta_neg, Delta_pos], dtype=torch.float32)
         self.weight = weight
+        self.reduction = reduction
 
     def forward(self, x, target):
         device = x.device
@@ -207,9 +266,15 @@ class BinaryVSLoss(nn.Module):
         # print(batch_iota.shape,batch_Delta.shape,'batch_iota.shape,batch_Delta.shape')
         output = x * batch_Delta - batch_iota
 
-        return F.binary_cross_entropy_with_logits(10 * output, target, weight=self.weight)
+        if self.reduction == 'none':
+            return F.binary_cross_entropy_with_logits(10 * output, target, weight=self.weight, reduction = self.reduction)
+        
+        if self.reduction == 'mean':
+            return F.binary_cross_entropy_with_logits(10 * output, target, weight=self.weight)
 
-def train_epoch(model, optimizer, scheduler, criterion, train_loader,loss_type,alpha,gamma):
+        
+
+def train_epoch(model, optimizer, scheduler, criterion, train_loader,loss_type,alpha,gamma,augment_features=None):
     model.train()
     total_loss_accumulated = 0.0  # Initialize total loss accumulated over the epoch
     total_batches = 0  # Keep track of the number of batches processed
@@ -226,7 +291,7 @@ def train_epoch(model, optimizer, scheduler, criterion, train_loader,loss_type,a
         if loss_type == 'erm':
             return loss_ce.mean()
 
-        elif loss_type == 'cvar':
+        elif loss_type == 'dag':
             chi_loss_np = search_func(loss_ce, alpha_cvar)
             cutpt = optimize.fminbound(chi_loss_np, np.min(loss_ce.cpu().detach().numpy()) - 1000.0, np.max(loss_ce.cpu().detach().numpy()))
             loss = searched_lamda_loss(loss_ce, cutpt, alpha_cvar)
@@ -247,14 +312,50 @@ def train_epoch(model, optimizer, scheduler, criterion, train_loader,loss_type,a
             return loss
         
         elif loss_type == 'vs':
-            vs_loss_fn = BinaryVSLoss(iota_pos=-0.05, iota_neg=0.05, Delta_pos=0.9, Delta_neg=1.1, weight=None)
+            vs_loss_fn = BinaryVSLoss('mean', iota_pos=-0.05, iota_neg=0.05, Delta_pos=0.9, Delta_neg=1.1, weight=None)
             loss = vs_loss_fn(output,labels)
             return loss
+        
+        elif loss_type == 'vs_cvar_auc':
+            vs_loss_fn = BinaryVSLoss('none', iota_pos=-0.05, iota_neg=0.05, Delta_pos=0.9, Delta_neg=1.1, weight=None)
+            vs_loss = loss = vs_loss_fn(output,labels)
+            chi_loss_np = search_func(vs_loss, alpha_cvar)
+            cutpt = optimize.fminbound(chi_loss_np, np.min(loss_ce.cpu().detach().numpy()) - 1000.0, np.max(loss_ce.cpu().detach().numpy()))
+            cvar_loss = searched_lamda_loss(loss_ce, cutpt, alpha_cvar)
+
+            p_auc_loss_fn = pAUCLoss(k=False, reduction='mean', norm=False)
+            # Separate positive and negative scores
+            score_pos = output[labels == 1]  # Logits for positive samples
+            score_neg = output[labels == 0]  # Logits for negative samples
+            
+            if len(score_pos) == 0 or len(score_neg) == 0:
+                # To avoid errors if a batch has only one class
+                return loss_ce.mean()
+            
+            auc_loss = p_auc_loss_fn(score_neg, score_pos)
+            loss = cvar_loss + gamma_auc * auc_loss
+            return loss
+
+
 
 
     for batch in tqdm(train_loader, desc="Training Epoch"):
         inputs, target_labels = batch
         inputs, target_labels= inputs.to(device), target_labels.to(device)
+
+
+        # Apply augmentation to all features
+        if augment_features:
+            augmented_inputs = augment_features(inputs)  # Augment all features
+
+            # Combine original features with augmented features
+            combined_inputs = torch.cat([inputs, augmented_inputs], dim=0)
+            combined_labels = torch.cat([target_labels, target_labels], dim=0)  # Labels are duplicated
+
+            # Shuffle the combined batch to avoid ordering effects
+            perm = torch.randperm(combined_inputs.size(0))
+            inputs, target_labels = combined_inputs[perm], combined_labels[perm]
+
         optimizer.zero_grad()
         output,_ = model(inputs)
         # loss_batch = criterion(output.squeeze(), target_labels)
@@ -345,22 +446,22 @@ def evaluate(model,  val_loader):
         recall = recall_score(all_true_labels, all_predictions, labels=[0, 1], average="macro")
         f1 = f1_score(all_true_labels, all_predictions, labels=[0, 1], average="macro")
 
-        # real_fake = calc_cm_each(conf_matrix)
+       
 
         return (val_loss, accuracy, auc, precision, recall, f1)
 
 
-def model_trainer(loss_type, alpha,gamma):
+def model_trainer(loss_type, alpha,gamma,aug):
 
-    model = ClassifierModel().to(device)
-    train_dataset = ImageDataset(
+    model = DetectorModel().to(device)
+    train_dataset = FakeRealDataset(
     hdf5_filename='cup_train.h5',
     labels_filename=args.train_datapath,
     dataset_name='train_features'
 )
 
 
-    test_dataset = ImageDataset(
+    test_dataset = FakeRealDataset(
     hdf5_filename='cup_val.h5',
     labels_filename=args.test_datapath,
     dataset_name='test_features'
@@ -369,7 +470,7 @@ def model_trainer(loss_type, alpha,gamma):
     train_loader = DataLoader(train_dataset, batch_size=args.train_batchsize, shuffle=True,pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.test_batchsize,shuffle=False,pin_memory=True)
 
-
+  
     criterion = nn.BCEWithLogitsLoss(reduction='none')
     
     
@@ -379,18 +480,20 @@ def model_trainer(loss_type, alpha,gamma):
     # Initialize the learning rate scheduler
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs / 4, eta_min=args.min_lr)  # eta_min is the minimum lr
 
-    if loss_type == 'cvar':
-        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_alpha_{alpha}'
+    if loss_type == 'dag':
+        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_alpha_{alpha}_aug_{aug}'
     elif loss_type == 'auc':
-        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_gamma_{gamma}'
+        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_gamma_{gamma}_aug_{aug}'
     elif loss_type =='vs':
-        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}'
+        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_aug_{aug}e'
     elif loss_type == 'erm':
-        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}'
+        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_aug_{aug}'
+    elif loss_type == 'vs_cvar_auc':
+        args.checkpoints_dir=f'{args.checkpoints_dir}_{loss_type}_alpha_{alpha}_gamma_{gamma}_aug_{aug}'
 
     os.makedirs(args.checkpoints_dir, exist_ok=True)
     metrics_file_path = os.path.join(args.checkpoints_dir, 'performance_metrics.txt')
-    print(metrics_file_path,'111111111111111')
+    print(metrics_file_path,'metrics_file_path')
     with open(os.path.join(args.checkpoints_dir, f'args_train.txt'), 'w') as f:
         json.dump(args.__dict__, f, indent=2)
 
@@ -402,7 +505,7 @@ def model_trainer(loss_type, alpha,gamma):
         print(epoch_str)
 
         # Training phase
-        train_loss = train_epoch(model, optimizer, scheduler, criterion, train_loader, loss_type,alpha,gamma)
+        train_loss = train_epoch(model, optimizer, scheduler, criterion, train_loader, loss_type,alpha,gamma,augment_features=augment_features)
 
         # Validation phase
         (val_loss, 
@@ -440,6 +543,18 @@ def model_trainer(loss_type, alpha,gamma):
         }
         torch.save(checkpoint, checkpoint_path)
 
+        # # Log metrics to result file
+        # print(f'{epoch},'
+        #     f'{val_loss:.6f},'
+        #     f'{accuracy:.6f},'
+        #     f'{auc:.6f},'
+        #     f'{precision:.6f},'
+        #     f'{recall:.6f},'
+        #     f'{f1_score:.6f},'
+        #     f'{target[0]},{target[1]}',
+        #     file=fw, flush=True)
+
+
 
 if __name__ == '__main__':
     if args.seed < 0:
@@ -448,4 +563,4 @@ if __name__ == '__main__':
 
 
 
-    model_trainer(loss_type='erm',alpha=0.7,gamma=0.8)
+    model_trainer(loss_type='vs_cvar_auc',alpha=0.9,gamma=0.6, aug=True)
