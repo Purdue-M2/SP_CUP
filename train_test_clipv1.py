@@ -191,12 +191,6 @@ def augment_features(features):
         # augmented_features.append(augmented)
         augmented_feature = chosen_aug(feature)  # Apply directly if `feature` is not iterable
         augmented_features.append(augmented_feature)
-        # for z in feature:
-        #     print(f"Input shape: {z.shape}")
-        #     augmented_z = chosen_aug(z)
-        #     print(f"Augmented shape: {augmented_z.shape}")
-        #     augmented_features.append(augmented_z)
-
     return torch.stack(augmented_features)
 
 
