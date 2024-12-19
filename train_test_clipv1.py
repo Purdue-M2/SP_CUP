@@ -104,8 +104,6 @@ parser.add_argument('--seed', default=8079, type=int,
 parser.add_argument('--num_epochs', default=100, type=int)
 parser.add_argument('--lr', '--learning-rate', default=1e-5, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
-# parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
-#                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for the scheduler')
 parser.add_argument('--weight_decay', default=6e-5, type=float,
                     metavar='W', help='weight decay (default: 6e-5)',
